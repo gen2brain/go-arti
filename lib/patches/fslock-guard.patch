@@ -1,0 +1,47 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -153,19 +153,30 @@
+ /// Try to lock `f`, blocking if need be.
+ ///
+ /// On non-android, this just calls [`fs::File::lock`].
+-#[cfg(not(target_os = "android"))]
++#[cfg(not(any(target_os = "android", target_family = "wasm")))]
+ fn do_lock(f: &fs::File) -> std::io::Result<()> {
+     f.lock()
+ }
+ 
++// wasm has no advisory file locking; single-process, so this is a no-op.
++#[cfg(target_family = "wasm")]
++fn do_lock(_f: &fs::File) -> std::io::Result<()> {
++    Ok(())
++}
++
+ /// Try to lock `f`, without blocking.
+ ///
+ /// On non-android, this just calls [`fs::File::try_lock`].
+-#[cfg(not(target_os = "android"))]
++#[cfg(not(any(target_os = "android", target_family = "wasm")))]
+ fn do_try_lock(f: &fs::File) -> Result<(), std::fs::TryLockError> {
+     f.try_lock()
+ }
+ 
++#[cfg(target_family = "wasm")]
++fn do_try_lock(_f: &fs::File) -> Result<(), std::fs::TryLockError> {
++    Ok(())
++}
++
+ /// Try to lock `f`, blocking if need be.
+ ///
+ /// On android, we need to use flock manually, since Rust (as of May 2026)
+@@ -429,9 +440,8 @@
+ 
+     /// Return true if `lf` currently exists with the given `path`, and false otherwise.
+     pub(crate) fn lockfile_has_path(_lf: &std::fs::File, _path: &Path) -> std::io::Result<bool> {
+-        Err(std::io::Error::other(
+-            "fslock-guard does not support this operating system".to_string(),
+-        ))
++        // wasm: locking is a no-op (single process), so the lock "matches".
++        Ok(true)
+     }
+ }
+ 

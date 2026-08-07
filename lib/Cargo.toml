@@ -1,0 +1,65 @@
+[package]
+name = "arti-shim"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "bootstrap"
+path = "src/bin/bootstrap.rs"
+
+[dependencies]
+# Base client. Onion-service features are added per-target below.
+arti-client = { version = "0.44", default-features = false }
+tor-rtcompat = { version = "0.44", default-features = false }
+tor-persist = { version = "0.44", features = ["testing"] }
+tor-hsservice = "0.44"
+tor-cell = "0.44"
+safelog = "0.9"
+tor-general-addr = "0.44"
+rustls = { version = "0.23", default-features = false, features = ["tls12", "logging"] }
+rustls-rustcrypto = { version = "0.0.2-alpha", default-features = false, features = ["alloc", "tls12"] }
+futures-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+futures = "0.3"
+async-task = "4"
+async-trait = "0.1"
+web-time = "1"
+
+# Forward Arti's tracing logs to the host (diagnostics) on wasm.
+[target.'cfg(target_arch = "wasm32")'.dependencies.tracing]
+version = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.tracing-subscriber]
+version = "0.3"
+default-features = false
+features = ["fmt"]
+
+# Native reactor backend (polling + sockets); on wasm the reactor is host-backed.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+polling = "3"
+socket2 = "0.5"
+arti-client = { version = "0.44", default-features = false, features = ["onion-service-client", "onion-service-service"] }
+
+# wasm target is wasm32-wasip1: WASI provides fs/clock/random, so only TCP is a
+# host import. sqlite is real, compiled with /opt/wasi-sdk (see CLAUDE.md).
+# Onion-service keys use a fs-backed keystore under the WASI state dir (persistent);
+# see patches/arti-client.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+rusqlite = { version = "0.39", features = ["bundled"] }
+arti-client = { version = "0.44", default-features = false, features = [
+    "onion-service-client",
+    "onion-service-service",
+    "ephemeral-keystore",
+    "keymgr",
+] }
+
+# Arti gates its wasm support on target_os = "unknown"; wasip1 is
+# target_os = "wasi", so these patches broaden those gates and skip fs-locking.
+[patch.crates-io]
+tor-rtcompat = { path = "patches/tor-rtcompat" }
+arti-client = { path = "patches/arti-client" }
+tor-dirmgr = { path = "patches/tor-dirmgr" }
+fslock-guard = { path = "patches/fslock-guard" }

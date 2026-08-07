@@ -1,0 +1,81 @@
+--- a/src/client.rs
++++ b/src/client.rs
+@@ -28,7 +28,7 @@
+ use tor_memquota::MemoryQuotaTracker;
+ use tor_netdir::{NetDirProvider, params::NetParameters};
+ use tor_persist::StateMgr;
+-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
++#[cfg(target_arch = "wasm32")]
+ use tor_persist::TestingStateMgr;
+ #[cfg(feature = "onion-service-service")]
+ use tor_persist::state_dir::StateDirectory;
+@@ -74,11 +74,11 @@
+ use tor_rtcompat::scheduler::TaskHandle;
+ use tracing::{debug, info, instrument, warn};
+ 
+-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
++#[cfg(not(target_arch = "wasm32"))]
+ use tor_persist::FsStateMgr as UsingStateMgr;
+ 
+ // TODO wasm: This is not the right choice, but at least it compiles.
+-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
++#[cfg(target_arch = "wasm32")]
+ use tor_persist::TestingStateMgr as UsingStateMgr;
+ 
+ /// An active client session on the Tor network.
+@@ -318,6 +318,24 @@
+     ///
+     /// Returns `Ok(None)` if keystore use is disabled.
+     fn create_keymgr(config: &TorClientConfig) -> StdResult<Option<Arc<KeyMgr>>, ErrorDetail> {
++        #[cfg(target_arch = "wasm32")]
++        {
++            // Persistent, fs-backed keystore under the (WASI) state dir, so
++            // onion-service keys survive restarts when a persistent cache dir is
++            // mounted. It uses the WASI filesystem just like the dir cache.
++            let (state_dir, _mistrust) = config.state_dir()?;
++            let key_store_dir = state_dir.join("keystore");
++            let permissions = config.storage.permissions();
++            let store: Box<dyn Keystore> = Box::new(
++                ArtiNativeKeystore::from_path_and_mistrust(&key_store_dir, permissions)?,
++            );
++            let keymgr = KeyMgrBuilder::default()
++                .primary_store(store)
++                .build()
++                .map_err(|_| internal!("failed to build keymgr"))?;
++            return Ok(Some(Arc::new(keymgr)));
++        }
++        #[allow(unreachable_code)]
+         let keystore = config.storage.keystore();
+         let permissions = config.storage.permissions();
+         let primary_store: Box<dyn Keystore> = match keystore.primary_kind() {
+@@ -1070,7 +1088,7 @@
+ 
+     /// Construct a state manager from the client configuration.
+     fn statemgr_from_config(config: &TorClientConfig) -> Result<UsingStateMgr, ErrorDetail> {
+-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
++        #[cfg(not(target_arch = "wasm32"))]
+         {
+             use tor_persist::FsStateMgr;
+ 
+@@ -1078,9 +1096,10 @@
+             FsStateMgr::from_path_and_mistrust(state_dir, mistrust)
+                 .map_err(ErrorDetail::StateMgrSetup)
+         }
+-        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
++        #[cfg(target_arch = "wasm32")]
+         {
+-            unimplemented!()
++            let _ = config;
++            Ok(tor_persist::TestingStateMgr::new())
+         }
+     }
+ 
+@@ -2478,7 +2497,7 @@
+         // TODO wasm: This ins't really how things should be long term,
+         // but once we have a more generic notion of configuring storage
+         // we can change this to comply with it.
+-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
++        #[cfg(not(target_arch = "wasm32"))]
+         {
+             if state_cfg != self.statemgr.path() {
+                 how.cannot_change("storage.state_dir").map_err(wrap_err)?;

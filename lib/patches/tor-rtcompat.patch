@@ -1,0 +1,67 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -255,7 +255,7 @@
+ [dev-dependencies.tor-basic-utils]
+ version = "0.44.0"
+ 
+-[target.'cfg(not(all(target_arch="wasm32", target_os="unknown")))'.dependencies.socket2]
++[target.'cfg(not(target_family = "wasm"))'.dependencies.socket2]
+ version = "0.6.1"
+ 
+ [target."cfg(unix)".dependencies.libc]
+--- a/src/impls.rs
++++ b/src/impls.rs
+@@ -101,7 +101,7 @@
+ /// socket with the options we need and with consistent behaviour across all runtimes. For example
+ /// if each runtime were using a different `listen()` backlog size, it might be difficult to debug
+ /// related issues.
+-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
++#[cfg(not(target_arch = "wasm32"))]
+ pub(crate) fn tcp_listen(
+     addr: &std::net::SocketAddr,
+     options: &TcpListenOptions,
+@@ -188,7 +188,7 @@
+ }
+ 
+ /// Stub replacement for tcp_listen on wasm32-unknown
+-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
++#[cfg(target_arch = "wasm32")]
+ pub(crate) fn tcp_listen(
+     _addr: &std::net::SocketAddr,
+     _options: &TcpListenOptions,
+@@ -211,7 +211,7 @@
+ /// Historically we relied on the runtime to create and connect the socket, but we need some
+ /// specific socket options set, and not all runtimes will behave the same. It's better for us to
+ /// create the socket with the options we need and with consistent behaviour across all runtimes.
+-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
++#[cfg(not(target_arch = "wasm32"))]
+ pub(crate) fn tcp_pre_connect(
+     addr: &std::net::SocketAddr,
+     options: &TcpConnectOptions,
+@@ -265,7 +265,7 @@
+ }
+ 
+ /// Stub replacement for tcp_pre_connect on wasm32-unknown
+-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
++#[cfg(target_arch = "wasm32")]
+ pub(crate) fn tcp_pre_connect(
+     _addr: &std::net::SocketAddr,
+     _options: &TcpConnectOptions,
+@@ -281,7 +281,7 @@
+ /// Runtimes that want to connect manually should use [`tcp_pre_connect()`] to set up the socket,
+ /// and then connect it manually.
+ #[cfg(any(feature = "async-std", feature = "smol"))]
+-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
++#[cfg(not(target_arch = "wasm32"))]
+ pub(crate) async fn tcp_async_io_connect(
+     addr: &std::net::SocketAddr,
+     options: &TcpConnectOptions,
+@@ -324,7 +324,7 @@
+ 
+ /// Stub replacement for tcp_async_io_connect on wasm32-unknown
+ #[cfg(any(feature = "async-std", feature = "smol"))]
+-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
++#[cfg(target_arch = "wasm32")]
+ pub(crate) async fn tcp_async_io_connect(
+     _addr: &std::net::SocketAddr,
+     _options: &TcpConnectOptions,
