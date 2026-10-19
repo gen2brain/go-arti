@@ -1,5 +1,3 @@
-//! Assembly of the custom `CompoundRuntime` from our providers.
-
 use std::io;
 use std::time::Duration;
 
@@ -13,8 +11,6 @@ use tor_rtcompat::{
 
 use crate::net::TcpProvider;
 use crate::tls::TorTls;
-
-// --- executor provider -----------------------------------------------------
 
 #[derive(Clone, Debug)]
 pub struct Exec;
@@ -40,8 +36,6 @@ impl Blocking for Exec {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        // No threads: run inline. On wasm there is no real blocking IO - network
-        // is async via the host, and sqlite/fs go through WASI.
         futures::future::ready(f())
     }
 
@@ -54,8 +48,6 @@ impl Blocking for Exec {
     }
 }
 
-// --- time provider ---------------------------------------------------------
-
 #[derive(Clone, Debug)]
 pub struct TimeP;
 
@@ -64,10 +56,7 @@ impl SleepProvider for TimeP {
     fn sleep(&self, duration: Duration) -> Self::SleepFuture {
         crate::exec::sleep(duration)
     }
-    // now() / wallclock() use the defaults, backed by web-time (host-backed on wasm).
 }
-
-// --- udp provider (unsupported) --------------------------------------------
 
 #[derive(Clone, Debug)]
 pub struct NoUdp;
@@ -95,20 +84,16 @@ impl UdpSocket for NoUdpSocket {
     }
 }
 
-// --- assembly --------------------------------------------------------------
-
-/// The concrete runtime type Arti runs on.
 pub type ArtiRuntime =
     CompoundRuntime<Exec, TimeP, RealCoarseTimeProvider, TcpProvider, TcpProvider, TorTls, NoUdp>;
 
-/// Construct the runtime.
 pub fn arti_runtime() -> ArtiRuntime {
     CompoundRuntime::new(
         Exec,
         TimeP,
         RealCoarseTimeProvider::new(),
-        TcpProvider, // tcp slot
-        TcpProvider, // unix slot (unsupported stub)
+        TcpProvider,
+        TcpProvider,
         TorTls::new(),
         NoUdp,
     )

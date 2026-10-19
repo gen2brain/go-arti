@@ -1,7 +1,4 @@
-// Command torprobe measures how fast and how concurrently the Tor pool can dial
-// reachable public hosts, isolating Tor dial capacity from BitTorrent peer death.
-//
-//	go run ./examples/torprobe [instances] [concurrency]
+// Command torprobe measures how fast and how concurrently a Tor pool dials public hosts.
 package main
 
 import (

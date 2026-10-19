@@ -1,7 +1,3 @@
-//! Single-threaded, cooperatively-scheduled executor with an integrated timer
-//! set. No background threads: `block_on` drives spawned tasks, timers, and the
-//! reactor together.
-
 use std::cell::RefCell;
 use std::collections::{BinaryHeap, VecDeque};
 use std::future::Future;
@@ -22,8 +18,6 @@ thread_local! {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-// --- timers ----------------------------------------------------------------
-
 struct Timer {
     deadline: Instant,
     id: u64,
@@ -42,12 +36,10 @@ impl PartialOrd for Timer {
 }
 impl Ord for Timer {
     fn cmp(&self, o: &Self) -> std::cmp::Ordering {
-        // Reversed so the BinaryHeap behaves as a min-heap on deadline.
         o.deadline.cmp(&self.deadline).then(o.id.cmp(&self.id))
     }
 }
 
-/// A future that completes after a duration, backed by the executor's timer set.
 pub struct Sleep {
     deadline: Instant,
     registered: bool,
@@ -72,7 +64,6 @@ impl Future for Sleep {
     }
 }
 
-/// Return a future that completes after `dur`.
 pub fn sleep(dur: Duration) -> Sleep {
     Sleep {
         deadline: Instant::now() + dur,
@@ -81,9 +72,6 @@ pub fn sleep(dur: Duration) -> Sleep {
     }
 }
 
-// --- executor --------------------------------------------------------------
-
-/// Spawn a detached task.
 pub fn spawn<F>(fut: F)
 where
     F: Future<Output = ()> + 'static,
@@ -95,9 +83,6 @@ where
     task.detach();
 }
 
-/// Drop pending tasks without running their destructors. Arti's long-lived
-/// background tasks never complete; dropping them normally re-enters the
-/// being-destroyed thread-local queue and panics, so at shutdown we leak them.
 pub fn forget_pending() {
     QUEUE.with(|q| {
         let mut q = q.borrow_mut();
@@ -119,7 +104,6 @@ fn run_ready() {
     }
 }
 
-/// Time until the earliest pending timer, or `None` if no timers are armed.
 fn next_timer_timeout() -> Option<Duration> {
     TIMERS.with(|h| {
         h.borrow()
@@ -128,7 +112,6 @@ fn next_timer_timeout() -> Option<Duration> {
     })
 }
 
-/// Wake every timer whose deadline has passed.
 fn fire_expired_timers() {
     let now = Instant::now();
     loop {
@@ -146,9 +129,6 @@ fn fire_expired_timers() {
     }
 }
 
-/// Drive spawned tasks, timers, and the reactor for up to `budget`, then return.
-/// Unlike [`block_on`] there is no top-level future: this lets background tasks
-/// (onion accept loops) progress between capi calls while serving.
 pub fn pump(budget: Duration) {
     let start = Instant::now();
     loop {
@@ -159,7 +139,6 @@ pub fn pump(budget: Duration) {
             return;
         }
 
-        // More queued work: keep running it without blocking the reactor.
         if QUEUE.with(|q| !q.borrow().is_empty()) {
             continue;
         }
@@ -184,7 +163,6 @@ impl Wake for MainWaker {
     }
 }
 
-/// Run `fut` to completion, driving spawned tasks, timers and the reactor.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
     futures::pin_mut!(fut);
     let mw = Arc::new(MainWaker(AtomicBool::new(true)));

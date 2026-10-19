@@ -1,9 +1,3 @@
-//! wasm reactor backend: the native `polling` reactor's counterpart, routed
-//! through `arti_host` imports satisfied by the Go (wazero) host. Connect and
-//! write are blocking host calls; reads are non-blocking (EAGAIN) and `poll`
-//! blocks until the host signals some connection is readable (level-triggered,
-//! so we re-poll every parked reader on wake).
-
 use std::cell::RefCell;
 use std::io;
 use std::net::SocketAddr;
@@ -16,14 +10,11 @@ use tor_rtcompat::StreamOps;
 
 #[link(wasm_import_module = "arti_host")]
 unsafe extern "C" {
-    /// Blocking connect. `addr` is UTF-8 "ip:port". Returns id >= 0 or < 0 on error.
     fn arti_host_tcp_connect(addr_ptr: *const u8, addr_len: usize) -> i64;
-    /// Non-blocking read: n >= 0 bytes, -1 = EAGAIN, -2 = EOF, -3 = error.
+    fn arti_host_tcp_connect_status(id: u32) -> i32;
     fn arti_host_tcp_read(id: u32, ptr: *mut u8, len: usize) -> i64;
-    /// Blocking write: n >= 0 bytes written, < 0 on error.
     fn arti_host_tcp_write(id: u32, ptr: *const u8, len: usize) -> i64;
     fn arti_host_tcp_close(id: u32);
-    /// Block until some connection is readable, or `timeout_ms` (<0 = forever).
     fn arti_host_poll(timeout_ms: i32);
 }
 
@@ -35,7 +26,6 @@ fn arm_read(waker: Waker) {
     READ_WAKERS.with(|w| w.borrow_mut().push(waker));
 }
 
-/// Block until the host signals readiness (or timeout), then wake parked readers.
 pub fn poll(timeout: Option<Duration>) {
     let ms = timeout
         .map(|d| d.as_millis().min(i32::MAX as u128) as i32)
@@ -47,7 +37,6 @@ pub fn poll(timeout: Option<Duration>) {
     }
 }
 
-/// A TCP stream identified by a host-side connection id.
 pub struct Conn {
     id: u32,
 }
@@ -57,7 +46,6 @@ impl Conn {
         Self::connect_str(&addr.to_string()).await
     }
 
-    /// Connect to a "host:port" target; the host resolves the name.
     pub async fn connect_str(addr: &str) -> io::Result<Conn> {
         let id = unsafe { arti_host_tcp_connect(addr.as_ptr(), addr.len()) };
         if id < 0 {
@@ -66,7 +54,22 @@ impl Conn {
                 "host connect failed",
             ));
         }
-        Ok(Conn { id: id as u32 })
+        let conn = Conn { id: id as u32 };
+        futures::future::poll_fn(
+            |cx| match unsafe { arti_host_tcp_connect_status(conn.id) } {
+                0 => {
+                    arm_read(cx.waker().clone());
+                    Poll::Pending
+                }
+                1 => Poll::Ready(Ok(())),
+                _ => Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "host connect failed",
+                ))),
+            },
+        )
+        .await?;
+        Ok(conn)
     }
 }
 

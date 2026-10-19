@@ -1,9 +1,4 @@
-// Package arti is a self-contained, CGo-free Tor client for Go. It embeds the
-// Rust arti-client compiled to wasm32-wasip1 and runs it with wazero, exposing a
-// net.Conn Dialer, an http.Client, and onion-service hosting.
-//
-// A Client is one wasm instance with shared memory, so calls into it are
-// serialized. Use a Pool for concurrency.
+// Package arti is a CGo-free Tor client: arti-client compiled to wasm32-wasip1, run with wazero.
 package arti
 
 import (
@@ -19,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -31,15 +27,15 @@ import (
 //go:embed lib/arti.wasm.gz
 var wasmGz []byte
 
-// Client is a bootstrapped embedded Tor client. Create one with New, call
-// Bootstrap, then use DialContext / HTTPClient. It is safe for concurrent use.
+// Client is an embedded Tor client. It is safe for concurrent use; calls into it are serialized.
 type Client struct {
 	rt   wazero.Runtime
 	mod  api.Module
 	ctx  context.Context
-	root string
+	dir  string
+	temp bool
 
-	callMu  sync.Mutex // serializes all calls into the wasm module
+	callMu     sync.Mutex
 	alloc      api.Function
 	free       api.Function
 	boot       api.Function
@@ -55,10 +51,10 @@ type Client struct {
 
 	reactor *reactor
 
-	serveMu    sync.Mutex // guards the serving pump lifecycle
+	serveMu    sync.Mutex
 	serveCount int
 	serveStop  chan struct{}
-	serveDown  bool // set by Close; blocks further pump restarts
+	serveDown  bool
 	pumpWg     sync.WaitGroup
 }
 
@@ -67,17 +63,16 @@ type Option func(*options)
 
 type options struct {
 	stderr io.Writer
+	cache  wazero.CompilationCache
 }
 
-// WithStderr routes the embedded module's diagnostic output (bootstrap and
-// per-connection errors) to w instead of os.Stderr.
+// WithStderr sets where diagnostic output goes; the default is os.Stderr.
 func WithStderr(w io.Writer) Option {
 	return func(o *options) { o.stderr = w }
 }
 
-// New instantiates the embedded Tor module without bootstrapping (call Bootstrap
-// next). A non-empty cacheDir persists Tor's directory cache across runs;
-// otherwise a temporary directory is used.
+// New creates a Client that keeps its state in cacheDir, or in a temporary
+// directory if cacheDir is empty. Cancelling ctx aborts Bootstrap and closes the Client.
 func New(ctx context.Context, cacheDir string, opts ...Option) (*Client, error) {
 	o := options{stderr: os.Stderr}
 	for _, opt := range opts {
@@ -99,13 +94,14 @@ func New(ctx context.Context, cacheDir string, opts ...Option) (*Client, error) 
 		temp = true
 	}
 
-	rt := wazero.NewRuntime(ctx)
+	rc := wazero.NewRuntimeConfig()
+	if o.cache != nil {
+		rc = rc.WithCompilationCache(o.cache)
+	}
+	rt := wazero.NewRuntimeWithConfig(ctx, rc)
 	wasi_snapshot_preview1.MustInstantiate(ctx, rt)
 
-	c := &Client{rt: rt, ctx: ctx, reactor: newReactor()}
-	if temp {
-		c.root = root
-	}
+	c := &Client{rt: rt, ctx: ctx, dir: root, temp: temp, reactor: newReactor()}
 
 	if err := c.registerHost(ctx); err != nil {
 		rt.Close(ctx)
@@ -143,8 +139,6 @@ func New(ctx context.Context, cacheDir string, opts ...Option) (*Client, error) 
 	return c, nil
 }
 
-// lastError returns the most recent error string recorded inside the wasm
-// module, or "" if none. Call with callMu held.
 func (c *Client) lastError() string {
 	const cap = 512
 	res, err := c.alloc.Call(c.ctx, cap)
@@ -169,15 +163,14 @@ func (c *Client) lastError() string {
 	return string(msg)
 }
 
-// OnionService is a running onion service that reverse-proxies incoming streams
-// to a local target address. Close it to stop serving.
+// OnionService is a running onion service.
 type OnionService struct {
 	c    *Client
 	addr string
 	once sync.Once
 }
 
-// Address returns the service's .onion address (including the ".onion" suffix).
+// Address returns the .onion address.
 func (o *OnionService) Address() string { return o.addr }
 
 // Close stops serving this onion service.
@@ -186,9 +179,8 @@ func (o *OnionService) Close() error {
 	return nil
 }
 
-// ServeOnion launches an onion service that reverse-proxies each incoming stream
-// to targetAddr ("host:port"). With a persistent cacheDir the same nickname keeps
-// the same .onion address across runs.
+// ServeOnion launches an onion service proxied to targetAddr ("host:port"). The
+// nickname keeps its .onion address across runs when cacheDir is persistent.
 func (c *Client) ServeOnion(nickname, targetAddr string) (*OnionService, error) {
 	addr, err := c.launchOnion(nickname, targetAddr)
 	if err != nil {
@@ -198,7 +190,6 @@ func (c *Client) ServeOnion(nickname, targetAddr string) (*OnionService, error) 
 	return &OnionService{c: c, addr: addr}, nil
 }
 
-// launchOnion starts the service in the wasm module and returns its address.
 func (c *Client) launchOnion(nickname, targetAddr string) (string, error) {
 	c.callMu.Lock()
 	defer c.callMu.Unlock()
@@ -215,7 +206,7 @@ func (c *Client) launchOnion(nickname, targetAddr string) (string, error) {
 	}
 	defer c.freeBytes(tptr, len(targetAddr))
 
-	const outCap = 128 // a v3 .onion address is ~62 bytes
+	const outCap = 128
 	res, err := c.alloc.Call(c.ctx, outCap)
 	if err != nil {
 		return "", err
@@ -239,7 +230,6 @@ func (c *Client) launchOnion(nickname, targetAddr string) (string, error) {
 	return string(addr), nil
 }
 
-// startPump refcounts the pump goroutine up, starting it on the first service.
 func (c *Client) startPump() {
 	c.serveMu.Lock()
 	defer c.serveMu.Unlock()
@@ -254,7 +244,6 @@ func (c *Client) startPump() {
 	}
 }
 
-// stopPump refcounts the pump goroutine down, stopping it on the last service.
 func (c *Client) stopPump() {
 	c.serveMu.Lock()
 	defer c.serveMu.Unlock()
@@ -268,8 +257,6 @@ func (c *Client) stopPump() {
 	}
 }
 
-// pumpLoop drives the executor in bounded slices so service accept loops make
-// progress; each slice holds callMu at most pumpBudgetMs so Dials interleave.
 func (c *Client) pumpLoop(stop chan struct{}) {
 	defer c.pumpWg.Done()
 	const pumpBudgetMs = 100
@@ -288,8 +275,23 @@ func (c *Client) pumpLoop(stop chan struct{}) {
 	}
 }
 
-// Bootstrap connects to the Tor network and downloads directory information.
-// This can take tens of seconds. It only needs to be called once.
+func (c *Client) cacheDir() string { return filepath.Join(c.dir, "arti", "cache") }
+
+func (c *Client) hasDirCache() bool {
+	_, err := os.Stat(filepath.Join(c.cacheDir(), "dir.sqlite3"))
+	return err == nil
+}
+
+func (c *Client) copyDirCache(dst *Client) error {
+	c.callMu.Lock()
+	defer c.callMu.Unlock()
+	if err := os.RemoveAll(dst.cacheDir()); err != nil {
+		return err
+	}
+	return os.CopyFS(dst.cacheDir(), os.DirFS(c.cacheDir()))
+}
+
+// Bootstrap connects to the Tor network. It only needs to be called once.
 func (c *Client) Bootstrap() error {
 	c.callMu.Lock()
 	defer c.callMu.Unlock()
@@ -303,13 +305,9 @@ func (c *Client) Bootstrap() error {
 	return nil
 }
 
-// connectPollInterval is how often DialContext polls a pending connect. The
-// executor advances all pending connects during the pump between polls.
 const connectPollInterval = 40 * time.Millisecond
 
-// DialContext opens a stream to addr ("host:port") through Tor; host may be a
-// clearnet name/IP or a v3 .onion. The network argument is ignored. The connect
-// runs on the shared executor, so many Dials proceed concurrently.
+// DialContext opens a stream to addr ("host:port", host may be a .onion); network is ignored.
 func (c *Client) DialContext(ctx context.Context, _, addr string) (net.Conn, error) {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -346,7 +344,6 @@ func (c *Client) DialContext(ctx context.Context, _, addr string) (net.Conn, err
 	}
 }
 
-// connectStart begins a connect and returns its stream id.
 func (c *Client) connectStart(host string, port int) (uint32, error) {
 	c.callMu.Lock()
 	defer c.callMu.Unlock()
@@ -365,7 +362,6 @@ func (c *Client) connectStart(host string, port int) (uint32, error) {
 	return uint32(res[0]), nil
 }
 
-// connectPoll returns 1 (connected), 0 (pending) or -1 (failed, with message).
 func (c *Client) connectPoll(id uint32) (int32, string) {
 	c.callMu.Lock()
 	defer c.callMu.Unlock()
@@ -391,16 +387,12 @@ func (c *Client) Dial(network, addr string) (net.Conn, error) {
 	return c.DialContext(context.Background(), network, addr)
 }
 
-// HTTPClient returns an http.Client routed through Tor. It uses a
-// single-request-per-connection RoundTripper (not http.Transport, whose
-// concurrent goroutines serialize badly on the single-threaded module); https
-// TLS is done by Go over the Tor stream.
+// HTTPClient returns an http.Client routed through Tor.
 func (c *Client) HTTPClient() *http.Client {
 	return &http.Client{Transport: c.RoundTripper()}
 }
 
-// RoundTripper returns an http.RoundTripper that dials each request over a fresh
-// Tor stream and reads the response on the calling goroutine.
+// RoundTripper returns an http.RoundTripper that uses a new Tor stream per request.
 func (c *Client) RoundTripper() http.RoundTripper {
 	return roundTripper{c}
 }
@@ -442,7 +434,6 @@ func (rt roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// bodyCloser closes the underlying Tor stream when the response body is closed.
 type bodyCloser struct {
 	io.ReadCloser
 	conn net.Conn
@@ -454,9 +445,9 @@ func (b bodyCloser) Close() error {
 	return err
 }
 
-// Close tears down the wasm instance and removes any temporary cache directory.
+// Close closes the Client and removes a temporary directory.
 func (c *Client) Close() error {
-	c.reactor.Close() // unblock any in-flight read/write so the pump can stop
+	c.reactor.Close()
 	c.serveMu.Lock()
 	c.serveDown = true
 	if c.serveStop != nil {
@@ -468,13 +459,11 @@ func (c *Client) Close() error {
 	c.pumpWg.Wait()
 
 	err := c.rt.Close(c.ctx)
-	if c.root != "" {
-		os.RemoveAll(c.root)
+	if c.temp {
+		os.RemoveAll(c.dir)
 	}
 	return err
 }
-
-// --- memory helpers (call with callMu held) --------------------------------
 
 func (c *Client) writeBytes(data []byte) (uint32, error) {
 	res, err := c.alloc.Call(c.ctx, uint64(len(data)))
@@ -493,8 +482,6 @@ func (c *Client) freeBytes(ptr uint32, length int) {
 	c.free.Call(c.ctx, uint64(ptr), uint64(length))
 }
 
-// --- net.Conn over a Tor stream --------------------------------------------
-
 type conn struct {
 	c      *Client
 	id     uint32
@@ -505,8 +492,6 @@ type conn struct {
 	writeDeadline time.Time
 }
 
-// timeoutMs returns the milliseconds until d, clamped to >= 1, or 0 (block
-// forever) if d is zero. A deadline already in the past yields 1 (fail fast).
 func timeoutMs(d time.Time) uint64 {
 	if d.IsZero() {
 		return 0
@@ -518,8 +503,6 @@ func timeoutMs(d time.Time) uint64 {
 	return uint64(ms)
 }
 
-// timeoutError is a net.Error reporting a deadline overrun. It wraps
-// os.ErrDeadlineExceeded so errors.Is(err, os.ErrDeadlineExceeded) holds.
 type timeoutError struct{ op string }
 
 func (e timeoutError) Error() string   { return "arti: " + e.op + ": " + os.ErrDeadlineExceeded.Error() }
@@ -600,8 +583,6 @@ func (t *conn) Close() error {
 func (t *conn) LocalAddr() net.Addr  { return torAddr("tor") }
 func (t *conn) RemoteAddr() net.Addr { return torAddr(t.remote) }
 
-// Deadlines are enforced per Read/Write by passing the remaining time to the
-// wasm side, which races the operation against a timer.
 func (t *conn) SetDeadline(tm time.Time) error {
 	t.mu.Lock()
 	t.readDeadline, t.writeDeadline = tm, tm

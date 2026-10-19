@@ -1,7 +1,3 @@
-//! Native reactor backend: a `polling`-based, thread-less readiness reactor and
-//! a std-socket `Conn`. The wasm counterpart (`platform_wasm.rs`) exposes the
-//! same `Conn` + `poll` surface over `arti_host` host imports.
-
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -40,7 +36,6 @@ thread_local! {
 
 static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
 
-/// A borrowable raw fd for the poller (does not own/close it).
 struct FdRef(i32);
 impl AsFd for FdRef {
     fn as_fd(&self) -> BorrowedFd<'_> {
@@ -54,7 +49,6 @@ impl AsRawFd for FdRef {
     }
 }
 
-/// Register a file descriptor with the reactor; returns an opaque key.
 pub fn register(fd: i32) -> usize {
     REACTOR.with(|r| {
         let mut r = r.borrow_mut();
@@ -85,7 +79,6 @@ fn rearm(r: &mut Reactor, key: usize) {
     }
 }
 
-/// Register interest in readability, storing `waker` to be woken on readiness.
 pub fn arm_read(key: usize, waker: Waker) {
     REACTOR.with(|r| {
         let mut r = r.borrow_mut();
@@ -97,7 +90,6 @@ pub fn arm_read(key: usize, waker: Waker) {
     });
 }
 
-/// Register interest in writability, storing `waker` to be woken on readiness.
 pub fn arm_write(key: usize, waker: Waker) {
     REACTOR.with(|r| {
         let mut r = r.borrow_mut();
@@ -109,7 +101,6 @@ pub fn arm_write(key: usize, waker: Waker) {
     });
 }
 
-/// Remove a source from the reactor.
 pub fn deregister(key: usize) {
     REACTOR.with(|r| {
         let mut r = r.borrow_mut();
@@ -121,9 +112,6 @@ pub fn deregister(key: usize) {
     });
 }
 
-/// Block until at least one source is ready or `timeout` elapses, waking the
-/// wakers of any ready sources. This is the native analogue of the Go reactor's
-/// readiness poll.
 pub fn poll(timeout: Option<Duration>) {
     REACTOR.with(|r| {
         let mut r = r.borrow_mut();
@@ -151,11 +139,6 @@ pub fn poll(timeout: Option<Duration>) {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Conn: an async TCP stream driven by the reactor above.
-// ---------------------------------------------------------------------------
-
-/// A non-blocking TCP stream registered with the reactor.
 pub struct Conn {
     stream: TcpStream,
     key: usize,
@@ -167,7 +150,7 @@ impl Conn {
         sock.set_nonblocking(true)?;
         match sock.connect(&addr.into()) {
             Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(115) => {} // EINPROGRESS
+            Err(e) if e.raw_os_error() == Some(115) => {}
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(e),
         }

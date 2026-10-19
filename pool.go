@@ -2,75 +2,94 @@ package arti
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"sync"
 	"sync/atomic"
+
+	"github.com/tetratelabs/wazero"
 )
 
-// Pool is a set of independent Tor Client instances, each its own
-// single-threaded wasm instance, so dials distributed round-robin across them
-// run in parallel instead of serializing on one. The cost is one bootstrap and
-// one wasm instance (tens of MB) per Client.
+// Pool is a set of independent Clients used round-robin, so dials run in parallel.
 type Pool struct {
 	clients []*Client
 	next    atomic.Uint64
+	cache   wazero.CompilationCache
 }
 
-// NewPool creates and bootstraps size Client instances concurrently. A non-empty
-// cacheDir gives each Client its own persistent subdirectory; otherwise each uses
-// a temporary directory.
+// NewPool creates and bootstraps size Clients, each in its own subdirectory of
+// cacheDir, or in a temporary directory if cacheDir is empty.
 func NewPool(ctx context.Context, cacheDir string, size int, opts ...Option) (*Pool, error) {
 	if size < 1 {
 		size = 1
 	}
-	p := &Pool{clients: make([]*Client, size)}
+	p := &Pool{clients: make([]*Client, size), cache: wazero.NewCompilationCache()}
+	opts = append(slices.Clip(opts), func(o *options) { o.cache = p.cache })
 
-	type result struct {
-		i   int
-		c   *Client
-		err error
-	}
-	ch := make(chan result, size)
-	for i := 0; i < size; i++ {
-		go func(i int) {
-			dir := ""
-			if cacheDir != "" {
-				dir = filepath.Join(cacheDir, strconv.Itoa(i))
-				if err := os.MkdirAll(dir, 0o700); err != nil {
-					ch <- result{i, nil, err}
-					return
-				}
+	for i := range size {
+		dir := ""
+		if cacheDir != "" {
+			dir = filepath.Join(cacheDir, strconv.Itoa(i))
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				p.Close()
+				return nil, err
 			}
-			c, err := New(ctx, dir, opts...)
-			if err == nil {
-				err = c.Bootstrap()
-			}
-			ch <- result{i, c, err}
-		}(i)
-	}
-
-	var firstErr error
-	for k := 0; k < size; k++ {
-		r := <-ch
-		if r.err != nil {
-			if firstErr == nil {
-				firstErr = r.err
-			}
-			if r.c != nil {
-				r.c.Close()
-			}
-			continue
 		}
-		p.clients[r.i] = r.c
+		c, err := New(ctx, dir, opts...)
+		if err != nil {
+			p.Close()
+			return nil, err
+		}
+		p.clients[i] = c
 	}
-	if firstErr != nil {
+
+	if err := p.bootstrap(); err != nil {
 		p.Close()
-		return nil, firstErr
+		return nil, err
 	}
 	return p, nil
+}
+
+func (p *Pool) bootstrap() error {
+	var cold []*Client
+	seed := -1
+	for i, c := range p.clients {
+		switch {
+		case !c.hasDirCache():
+			cold = append(cold, c)
+		case seed < 0:
+			seed = i
+		}
+	}
+	if seed < 0 {
+		seed, cold = 0, cold[1:]
+	}
+	rest := p.clients
+	if len(cold) > 0 {
+		s := p.clients[seed]
+		if err := s.Bootstrap(); err != nil {
+			return err
+		}
+		for _, c := range cold {
+			if err := s.copyDirCache(c); err != nil {
+				return err
+			}
+		}
+		rest = slices.Delete(slices.Clone(rest), seed, seed+1)
+	}
+
+	errs := make([]error, len(rest))
+	var wg sync.WaitGroup
+	for i, c := range rest {
+		wg.Go(func() { errs[i] = c.Bootstrap() })
+	}
+	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // Client returns the next Client in round-robin order.
@@ -94,8 +113,7 @@ func (p *Pool) HTTPClient() *http.Client {
 	return &http.Client{Transport: p}
 }
 
-// RoundTrip implements http.RoundTripper, dispatching each request to the next
-// Client in the pool so concurrent requests run in parallel.
+// RoundTrip implements http.RoundTripper on the next Client in the pool.
 func (p *Pool) RoundTrip(req *http.Request) (*http.Response, error) {
 	return p.Client().RoundTripper().RoundTrip(req)
 }
@@ -106,6 +124,9 @@ func (p *Pool) Close() error {
 		if c != nil {
 			c.Close()
 		}
+	}
+	if p.cache != nil {
+		return p.cache.Close(context.Background())
 	}
 	return nil
 }

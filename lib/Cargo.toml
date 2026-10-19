@@ -12,7 +12,6 @@ name = "bootstrap"
 path = "src/bin/bootstrap.rs"
 
 [dependencies]
-# Base client. Onion-service features are added per-target below.
 arti-client = { version = "0.44", default-features = false }
 tor-rtcompat = { version = "0.44", default-features = false }
 tor-persist = { version = "0.44", features = ["testing"] }
@@ -28,7 +27,6 @@ async-task = "4"
 async-trait = "0.1"
 web-time = "1"
 
-# Forward Arti's tracing logs to the host (diagnostics) on wasm.
 [target.'cfg(target_arch = "wasm32")'.dependencies.tracing]
 version = "0.1"
 
@@ -37,16 +35,11 @@ version = "0.3"
 default-features = false
 features = ["fmt"]
 
-# Native reactor backend (polling + sockets); on wasm the reactor is host-backed.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 polling = "3"
 socket2 = "0.5"
 arti-client = { version = "0.44", default-features = false, features = ["onion-service-client", "onion-service-service"] }
 
-# wasm target is wasm32-wasip1: WASI provides fs/clock/random, so only TCP is a
-# host import. sqlite is real, compiled with /opt/wasi-sdk (see CLAUDE.md).
-# Onion-service keys use a fs-backed keystore under the WASI state dir (persistent);
-# see patches/arti-client.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 rusqlite = { version = "0.39", features = ["bundled"] }
 arti-client = { version = "0.44", default-features = false, features = [
@@ -56,8 +49,6 @@ arti-client = { version = "0.44", default-features = false, features = [
     "keymgr",
 ] }
 
-# Arti gates its wasm support on target_os = "unknown"; wasip1 is
-# target_os = "wasi", so these patches broaden those gates and skip fs-locking.
 [patch.crates-io]
 tor-rtcompat = { path = "patches/tor-rtcompat" }
 arti-client = { path = "patches/arti-client" }

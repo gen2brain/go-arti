@@ -1,6 +1,3 @@
-//! Native bootstrap test: bootstrap Tor and fetch one stream on the custom
-//! runtime, over real sockets. Fast iteration without the wasm/host layer.
-
 use std::error::Error;
 
 use arti_client::{TorClient, TorClientConfig};
@@ -18,8 +15,6 @@ fn main() {
             1
         }
     };
-    // Leak Arti's still-running background tasks instead of dropping them at
-    // thread-local teardown (which would re-enter the queue and panic).
     arti_shim::exec::forget_pending();
     std::process::exit(code);
 }

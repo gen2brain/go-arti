@@ -1,4 +1,4 @@
-// Fetch clearnet pages (http + https) and connect to a .onion service, all over embedded Tor.
+// Command fetch fetches http and https pages and connects to a .onion service over Tor.
 package main
 
 import (
@@ -32,11 +32,9 @@ func main() {
 
 	client := c.HTTPClient()
 
-	// Clearnet HTTP and HTTPS (TLS is performed by Go over the Tor stream).
 	show(client.Get("http://example.com/"))
 	show(client.Get("https://example.com/"))
 
-	// A .onion hidden service (raw stream; the Tor Project onion, port 80).
 	onion := "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion"
 	conn, err := c.Dial("tcp", onion+":80")
 	if err != nil {

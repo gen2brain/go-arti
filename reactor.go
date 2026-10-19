@@ -8,11 +8,9 @@ import (
 	"time"
 
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/sys"
 )
 
-// reactor implements the arti_host TCP host functions over real sockets and
-// per-conn reader goroutines: connect/write block, reads are non-blocking
-// (EAGAIN), and poll blocks until some connection becomes readable.
 type reactor struct {
 	mu     sync.Mutex
 	conns  map[uint32]*rconn
@@ -21,24 +19,36 @@ type reactor struct {
 	closed bool
 }
 
-// Close tears down every connection so a blocked read/poll returns at once,
-// releasing the module's call lock for shutdown.
 func (r *reactor) Close() {
 	r.mu.Lock()
 	r.closed = true
 	for _, c := range r.conns {
-		c.nc.Close()
+		c.close()
 	}
 	r.mu.Unlock()
 	r.signal()
 }
 
 type rconn struct {
-	nc     net.Conn
+	cancel context.CancelFunc
 	mu     sync.Mutex
+	nc     net.Conn
 	buf    []byte
 	eof    bool
 	failed bool
+}
+
+func (c *rconn) conn() net.Conn {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nc
+}
+
+func (c *rconn) close() {
+	c.cancel()
+	if nc := c.conn(); nc != nil {
+		nc.Close()
+	}
 }
 
 func newReactor() *reactor {
@@ -52,14 +62,37 @@ func (r *reactor) signal() {
 	}
 }
 
+func (r *reactor) isClosed() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closed
+}
+
 func (r *reactor) get(id uint32) *rconn {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.conns[id]
 }
 
-// pump reads from the socket into the conn's buffer, signalling the reactor so a
-// blocked poll wakes up.
+func (r *reactor) dial(ctx context.Context, c *rconn, addr string) {
+	d := net.Dialer{Timeout: connectTimeout}
+	nc, err := d.DialContext(ctx, "tcp", addr)
+	c.mu.Lock()
+	if err != nil || ctx.Err() != nil {
+		c.failed = true
+		c.mu.Unlock()
+		if nc != nil {
+			nc.Close()
+		}
+		r.signal()
+		return
+	}
+	c.nc = nc
+	c.mu.Unlock()
+	r.signal()
+	r.pump(c)
+}
+
 func (r *reactor) pump(c *rconn) {
 	b := make([]byte, 32*1024)
 	for {
@@ -84,7 +117,8 @@ func (r *reactor) pump(c *rconn) {
 	}
 }
 
-// registerHost defines the arti_host module the wasm imports.
+const connectTimeout = 30 * time.Second
+
 func (c *Client) registerHost(ctx context.Context) error {
 	r := c.reactor
 	_, err := c.rt.NewHostModuleBuilder("arti_host").
@@ -93,24 +127,34 @@ func (c *Client) registerHost(ctx context.Context) error {
 		if !ok {
 			return -1
 		}
-		nc, err := net.DialTimeout("tcp", string(addr), 30*time.Second)
-		if err != nil {
-			return -1
-		}
 		r.mu.Lock()
+		defer r.mu.Unlock()
 		if r.closed {
-			r.mu.Unlock()
-			nc.Close()
 			return -1
 		}
 		id := r.next
 		r.next++
-		conn := &rconn{nc: nc}
+		dctx, cancel := context.WithCancel(context.Background())
+		conn := &rconn{cancel: cancel}
 		r.conns[id] = conn
-		r.mu.Unlock()
-		go r.pump(conn)
+		go r.dial(dctx, conn, string(addr))
 		return int64(id)
 	}).Export("arti_host_tcp_connect").
+		NewFunctionBuilder().WithFunc(func(_ context.Context, id uint32) int32 {
+		conn := r.get(id)
+		if conn == nil {
+			return -1
+		}
+		conn.mu.Lock()
+		defer conn.mu.Unlock()
+		switch {
+		case conn.nc != nil:
+			return 1
+		case conn.failed:
+			return -1
+		}
+		return 0
+	}).Export("arti_host_tcp_connect_status").
 		NewFunctionBuilder().WithFunc(func(_ context.Context, mod api.Module, id, ptr, length uint32) int64 {
 		conn := r.get(id)
 		if conn == nil {
@@ -133,7 +177,7 @@ func (c *Client) registerHost(ctx context.Context) error {
 		if conn.eof {
 			return -2
 		}
-		return -1 // EAGAIN
+		return -1
 	}).Export("arti_host_tcp_read").
 		NewFunctionBuilder().WithFunc(func(_ context.Context, mod api.Module, id, ptr, length uint32) int64 {
 		conn := r.get(id)
@@ -144,9 +188,13 @@ func (c *Client) registerHost(ctx context.Context) error {
 		if !ok {
 			return -3
 		}
+		nc := conn.conn()
+		if nc == nil {
+			return -3
+		}
 		data := make([]byte, len(src))
 		copy(data, src)
-		n, err := conn.nc.Write(data)
+		n, err := nc.Write(data)
 		if err != nil {
 			return -3
 		}
@@ -158,17 +206,24 @@ func (c *Client) registerHost(ctx context.Context) error {
 		delete(r.conns, id)
 		r.mu.Unlock()
 		if conn != nil {
-			conn.nc.Close()
+			conn.close()
 		}
 	}).Export("arti_host_tcp_close").
-		NewFunctionBuilder().WithFunc(func(_ context.Context, _ api.Module, timeout int32) {
-		if timeout < 0 {
-			<-r.ready
-			return
+		NewFunctionBuilder().WithFunc(func(ctx context.Context, mod api.Module, timeout int32) {
+		var expired <-chan time.Time
+		if timeout >= 0 {
+			t := time.NewTimer(time.Duration(timeout) * time.Millisecond)
+			defer t.Stop()
+			expired = t.C
 		}
 		select {
 		case <-r.ready:
-		case <-time.After(time.Duration(timeout) * time.Millisecond):
+		case <-ctx.Done():
+		case <-expired:
+		}
+		if ctx.Err() != nil || r.isClosed() {
+			mod.CloseWithExitCode(context.Background(), 1)
+			panic(sys.NewExitError(1))
 		}
 	}).Export("arti_host_poll").
 		Instantiate(ctx)

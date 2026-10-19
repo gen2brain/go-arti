@@ -1,9 +1,3 @@
-//! `TlsProvider` over `futures-rustls` with the pure-Rust `rustls-rustcrypto`
-//! crypto provider. The certificate verifier deliberately accepts any cert:
-//! Tor does not use web-PKI; the relay cert is only a container for the link
-//! key, and real authentication happens later via the in-protocol CERTS cell
-//! (see the `TlsConnector` rustdoc in tor-rtcompat). This is correct for Tor.
-
 use std::borrow::Cow;
 use std::io::{self, Result as IoResult};
 use std::marker::PhantomData;
@@ -23,7 +17,6 @@ use futures_rustls::rustls::{
 use tor_rtcompat::tls::{TlsAcceptorSettings, TlsConnector};
 use tor_rtcompat::{CertifiedConn, StreamOps, TlsProvider};
 
-/// A [`TlsProvider`] using rustls with the rustcrypto crypto backend.
 #[derive(Clone)]
 pub struct TorTls {
     config: Arc<rustls::ClientConfig>,
@@ -31,7 +24,6 @@ pub struct TorTls {
 
 impl TorTls {
     pub fn new() -> Self {
-        // Install the pure-Rust crypto provider process-wide (idempotent).
         let _ = CryptoProvider::install_default(rustls_rustcrypto::provider());
         let provider = CryptoProvider::get_default().expect("crypto provider installed");
 
@@ -42,7 +34,6 @@ impl TorTls {
             )))
             .with_no_client_auth();
 
-        // tor-spec forbids TLS session resumption.
         config.resumption = rustls::client::Resumption::disabled();
 
         TorTls {
@@ -57,9 +48,6 @@ impl Default for TorTls {
     }
 }
 
-// --- CertifiedConn / StreamOps for the client TLS stream -------------------
-
-/// Newtype so we can implement the tor-rtcompat traits on the TLS stream.
 pub struct TorTlsStream<S>(futures_rustls::client::TlsStream<S>);
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TorTlsStream<S> {
@@ -127,8 +115,6 @@ impl<S> CertifiedConn for TorTlsStream<S> {
     }
 }
 
-// --- connector -------------------------------------------------------------
-
 pub struct TorConnector<S> {
     connector: futures_rustls::TlsConnector,
     _phantom: PhantomData<fn(S) -> S>,
@@ -178,8 +164,6 @@ where
     }
 }
 
-// --- unsupported server side ----------------------------------------------
-
 pub struct NoAcceptor<S>(PhantomData<fn() -> S>);
 
 #[async_trait]
@@ -196,7 +180,6 @@ where
     }
 }
 
-/// Uninhabited server-stream type (never constructed).
 pub enum UnsupportedTls {}
 impl AsyncRead for UnsupportedTls {
     fn poll_read(
@@ -245,8 +228,6 @@ impl CertifiedConn for UnsupportedTls {
         match *self {}
     }
 }
-
-// --- Tor's accept-any certificate verifier ---------------------------------
 
 #[derive(Debug)]
 struct Verifier(WebPkiSupportedAlgorithms);

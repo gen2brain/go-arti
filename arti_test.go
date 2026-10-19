@@ -17,10 +17,7 @@ import (
 	"time"
 )
 
-// The Tor Project's v3 onion service (serves the torproject.org site).
 const torProjectOnion = "2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion"
-
-// --- unit tests (no network) -----------------------------------------------
 
 func TestEmbeddedWasm(t *testing.T) {
 	wasm, err := gunzip(wasmGz)
@@ -47,7 +44,6 @@ func TestDialBadAddr(t *testing.T) {
 }
 
 func TestPoolRoundRobin(t *testing.T) {
-	// Round-robin selection without any network/bootstrap.
 	p := &Pool{clients: []*Client{{}, {}, {}}}
 	seen := map[*Client]int{}
 	for i := 0; i < 9; i++ {
@@ -63,8 +59,6 @@ func TestPoolRoundRobin(t *testing.T) {
 	}
 }
 
-// --- network tests (slow; skipped under -short) ----------------------------
-
 func newBootstrapped(t *testing.T, cacheDir string) *Client {
 	t.Helper()
 	c, err := New(context.Background(), cacheDir)
@@ -76,6 +70,46 @@ func newBootstrapped(t *testing.T, cacheDir string) *Client {
 		t.Fatalf("bootstrap: %v", err)
 	}
 	return c
+}
+
+func bootstrapAborted(t *testing.T, c *Client, stop func()) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- c.Bootstrap() }()
+	time.Sleep(500 * time.Millisecond)
+	stop()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Bootstrap succeeded, want an abort error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Bootstrap did not return after stop")
+	}
+}
+
+func TestBootstrapCancel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("network test; skipped under -short")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	c, err := New(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	bootstrapAborted(t, c, cancel)
+}
+
+func TestCloseDuringBootstrap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("network test; skipped under -short")
+	}
+	c, err := New(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrapAborted(t, c, func() { c.Close() })
 }
 
 func TestFetchOverTor(t *testing.T) {
@@ -158,8 +192,6 @@ func TestReadDeadline(t *testing.T) {
 	c := newBootstrapped(t, "")
 	defer c.Close()
 
-	// Connect but send no request, so the server sends nothing: a read with a
-	// short deadline must time out rather than block forever.
 	conn, err := c.Dial("tcp", "example.com:80")
 	if err != nil {
 		t.Fatalf("dial: %v", err)
@@ -196,7 +228,6 @@ func TestServeOnionRoundTrip(t *testing.T) {
 	defer srv.Close()
 	target := srv.Listener.Addr().String()
 
-	// The client hosting the service and reverse-proxying to the local server.
 	host := newBootstrapped(t, "")
 	defer host.Close()
 	svc, err := host.ServeOnion("roundtrip", target)
@@ -210,12 +241,10 @@ func TestServeOnionRoundTrip(t *testing.T) {
 	}
 	t.Logf("serving %s -> %s", onion, target)
 
-	// A second, independent client that fetches the onion over Tor.
 	client := newBootstrapped(t, "")
 	defer client.Close()
 	hc := client.HTTPClient()
 
-	// Descriptor publication and rendezvous take time; retry until reachable.
 	url := "http://" + onion + "/"
 	deadline := time.Now().Add(4 * time.Minute)
 	var lastErr error
@@ -230,7 +259,7 @@ func TestServeOnionRoundTrip(t *testing.T) {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == 200 && strings.Contains(string(body), want) {
-			return // success
+			return
 		}
 		lastErr = fmt.Errorf("status %s, body %q", resp.Status, body)
 		time.Sleep(6 * time.Second)

@@ -1,8 +1,3 @@
-//! The wasm C ABI consumed by the go-arti Go package. One bootstrapped
-//! `TorClient` and a table of open streams live in thread-locals (wasm is
-//! single-threaded); each exported call drives the executor with `block_on`. The
-//! host must serialize calls into the module.
-
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::{Cell, RefCell};
@@ -19,11 +14,8 @@ use futures::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{arti_runtime, block_on, ArtiRuntime};
 
-/// Distinct return code for a read/write that hit its deadline.
 const TIMEOUT: i64 = -4;
 
-/// Await `fut`, but give up after `timeout_ms` milliseconds. A non-positive
-/// `timeout_ms` blocks forever. Returns `None` if the deadline elapsed first.
 async fn with_timeout<F: Future>(timeout_ms: i32, fut: F) -> Option<F::Output> {
     if timeout_ms <= 0 {
         return Some(fut.await);
@@ -36,8 +28,6 @@ async fn with_timeout<F: Future>(timeout_ms: i32, fut: F) -> Option<F::Output> {
     }
 }
 
-/// State of a connect started by [`arti_connect_start`] and polled by
-/// [`arti_connect_poll`].
 enum Pending {
     Connecting,
     Ready(DataStream),
@@ -52,21 +42,16 @@ thread_local! {
     static LAST_ERR: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
-/// Record the most recent error so the host can retrieve it via
-/// [`arti_last_error`]. Also mirrored to stderr for live debugging.
 fn set_err(msg: impl Into<String>) {
     let msg = msg.into();
     eprintln!("go-arti: {msg}");
     LAST_ERR.with(|e| *e.borrow_mut() = msg);
 }
 
-/// Records LAST_ERR without the stderr mirror; for high-volume per-stream failures.
 fn record_err(msg: impl Into<String>) {
     LAST_ERR.with(|e| *e.borrow_mut() = msg.into());
 }
 
-/// Copy the most recent error string into wasm memory at `out` (capacity
-/// `out_cap`) and return its length (possibly truncated to `out_cap`).
 #[unsafe(no_mangle)]
 pub extern "C" fn arti_last_error(out_ptr: *mut u8, out_cap: usize) -> i64 {
     LAST_ERR.with(|e| {
@@ -78,7 +63,6 @@ pub extern "C" fn arti_last_error(out_ptr: *mut u8, out_cap: usize) -> i64 {
     })
 }
 
-/// Allocate `len` bytes of wasm linear memory for the host to write into.
 #[unsafe(no_mangle)]
 pub extern "C" fn arti_alloc(len: usize) -> *mut u8 {
     let mut buf = Vec::<u8>::with_capacity(len);
@@ -87,7 +71,6 @@ pub extern "C" fn arti_alloc(len: usize) -> *mut u8 {
     ptr
 }
 
-/// Free memory previously returned by [`arti_alloc`].
 #[unsafe(no_mangle)]
 pub extern "C" fn arti_free(ptr: *mut u8, len: usize) {
     if !ptr.is_null() {
@@ -95,8 +78,6 @@ pub extern "C" fn arti_free(ptr: *mut u8, len: usize) {
     }
 }
 
-/// Bootstrap the Tor client. Returns 0 on success, -1 on failure (details go to
-/// stderr). Safe to call once; a second call is a no-op returning 0.
 #[unsafe(no_mangle)]
 pub extern "C" fn arti_bootstrap() -> i32 {
     std::panic::set_hook(Box::new(|info| eprintln!("go-arti panic: {info}")));
@@ -111,8 +92,6 @@ pub extern "C" fn arti_bootstrap() -> i32 {
     }
 
     let result: Result<Arc<TorClient<ArtiRuntime>>, Box<dyn std::error::Error>> = block_on(async {
-        // State and keystore are in-memory on wasm; the dir cache lives on the
-        // (WASI) filesystem under these paths.
         let mut builder = TorClientConfig::builder();
         builder
             .storage()
@@ -138,10 +117,6 @@ pub extern "C" fn arti_bootstrap() -> i32 {
     }
 }
 
-/// Begin opening a Tor stream to `host:port` (clearnet or `.onion`). Returns a
-/// stream id (>= 1) to poll with [`arti_connect_poll`], or -1 on immediate
-/// failure. The connect runs on the executor, so many can be in flight at once;
-/// the host drives them with [`arti_pump`].
 #[unsafe(no_mangle)]
 pub extern "C" fn arti_connect_start(host_ptr: *const u8, host_len: usize, port: u16) -> i64 {
     let host = match std::str::from_utf8(unsafe {
@@ -172,7 +147,6 @@ pub extern "C" fn arti_connect_start(host_ptr: *const u8, host_len: usize, port:
             Ok(stream) => Pending::Ready(stream),
             Err(e) => Pending::Failed(format!("connect to {host}:{port} failed: {e}")),
         };
-        // Drop the result if the id was cancelled in the meantime.
         PENDING.with(|p| {
             if let Some(entry) = p.borrow_mut().get_mut(&id) {
                 *entry = slot;
@@ -183,8 +157,6 @@ pub extern "C" fn arti_connect_start(host_ptr: *const u8, host_len: usize, port:
     id as i64
 }
 
-/// Poll a pending connect. Returns 1 = connected (the stream is now readable via
-/// the same id), 0 = still connecting, -1 = failed (see [`arti_last_error`]).
 #[unsafe(no_mangle)]
 pub extern "C" fn arti_connect_poll(id: u32) -> i32 {
     let state = PENDING.with(|p| match p.borrow().get(&id) {
@@ -214,7 +186,6 @@ pub extern "C" fn arti_connect_poll(id: u32) -> i32 {
     }
 }
 
-/// Abandon a connect, dropping a pending or just-established stream.
 #[unsafe(no_mangle)]
 pub extern "C" fn arti_connect_cancel(id: u32) {
     PENDING.with(|p| {
@@ -225,9 +196,6 @@ pub extern "C" fn arti_connect_cancel(id: u32) {
     });
 }
 
-/// Read up to `len` bytes from stream `id` into wasm memory at `ptr`. Returns
-/// the number of bytes read (0 = EOF), -1 on error, or -4 on timeout.
-/// `timeout_ms <= 0` blocks until data is available.
 #[unsafe(no_mangle)]
 pub extern "C" fn arti_read(id: u32, ptr: *mut u8, len: usize, timeout_ms: i32) -> i64 {
     STREAMS.with(|s| {
@@ -248,9 +216,6 @@ pub extern "C" fn arti_read(id: u32, ptr: *mut u8, len: usize, timeout_ms: i32) 
     })
 }
 
-/// Write up to `len` bytes from wasm memory at `ptr` to stream `id`. Returns the
-/// number of bytes written, -1 on error, or -4 on timeout. `timeout_ms <= 0`
-/// blocks until the write completes.
 #[unsafe(no_mangle)]
 pub extern "C" fn arti_write(id: u32, ptr: *const u8, len: usize, timeout_ms: i32) -> i64 {
     STREAMS.with(|s| {
@@ -260,8 +225,6 @@ pub extern "C" fn arti_write(id: u32, ptr: *const u8, len: usize, timeout_ms: i3
             return -1;
         };
         let buf = unsafe { std::slice::from_raw_parts(ptr, len) };
-        // Write all bytes (arti's stream writes at most one cell per poll);
-        // returning a short count with no error would violate io::Write.
         let fut = async {
             stream.write_all(buf).await?;
             stream.flush().await?;
@@ -278,7 +241,6 @@ pub extern "C" fn arti_write(id: u32, ptr: *const u8, len: usize, timeout_ms: i3
     })
 }
 
-/// Close stream `id`.
 #[unsafe(no_mangle)]
 pub extern "C" fn arti_close(id: u32) {
     let stream = STREAMS.with(|s| s.borrow_mut().remove(&id));
@@ -288,16 +250,10 @@ pub extern "C" fn arti_close(id: u32) {
 }
 
 thread_local! {
-    // Keep launched services alive for the process lifetime.
     static SERVICES: RefCell<Vec<std::sync::Arc<tor_hsservice::RunningOnionService>>> =
         const { RefCell::new(Vec::new()) };
 }
 
-/// Launch an onion service `nickname`, reverse-proxying every incoming stream to
-/// local `target` ("host:port"), and write its `.onion` address into `out`
-/// (capacity `out_cap`); returns the address length or -1. The identity key
-/// persists in the keystore, so a persistent cache dir keeps the address across
-/// runs.
 #[unsafe(no_mangle)]
 pub extern "C" fn arti_onion_launch(
     nick_ptr: *const u8,
@@ -376,7 +332,6 @@ pub extern "C" fn arti_onion_launch(
     })
 }
 
-/// Accept incoming rendezvous streams and reverse-proxy each to `target`.
 async fn serve_onion<S>(requests: S, target: String)
 where
     S: futures::Stream<Item = tor_hsservice::RendRequest>,
@@ -391,8 +346,6 @@ where
     }
 }
 
-/// Accept one onion stream, dial `target` on the host, and splice them until
-/// either side closes.
 async fn proxy_stream(req: tor_hsservice::StreamRequest, target: String) {
     use tor_cell::relaycell::msg::Connected;
 
@@ -411,9 +364,6 @@ async fn proxy_stream(req: tor_hsservice::StreamRequest, target: String) {
         }
     };
 
-    // Splice both directions, tearing down when either ends. Arti closes with
-    // END/MISC (no public END/DONE for accepted streams), so a peer reading to
-    // raw EOF sees an error; HTTP peers frame by Content-Length and do not.
     let (onion_r, onion_w) = onion.split();
     let (local_r, local_w) = local.split();
     let up = pipe(onion_r, local_w);
@@ -422,8 +372,6 @@ async fn proxy_stream(req: tor_hsservice::StreamRequest, target: String) {
     futures::future::select(up, down).await;
 }
 
-/// Copy `r` to `w`, flushing after every chunk: arti's DataWriter only emits
-/// cells on flush, so a plain copy (flush-at-EOF) would stall a keep-alive peer.
 async fn pipe<R, W>(mut r: R, mut w: W)
 where
     R: futures::io::AsyncRead + Unpin,
@@ -443,9 +391,6 @@ where
     let _ = w.close().await;
 }
 
-/// Drive the executor for up to `budget_ms` so spawned tasks (onion accept loops
-/// and their stream copies) make progress. The host calls this in a loop while
-/// serving.
 #[unsafe(no_mangle)]
 pub extern "C" fn arti_pump(budget_ms: i32) {
     let ms = if budget_ms < 0 { 0 } else { budget_ms as u64 };

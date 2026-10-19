@@ -1,8 +1,3 @@
-//! `NetStreamProvider` implementations. The actual TCP stream type (`Conn`) and
-//! its reactor live in the `platform` module (native `polling` vs wasm
-//! `arti_host`); this file is the platform-agnostic provider + the unsupported
-//! unix/listen stubs.
-
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -66,9 +61,6 @@ impl NetStreamProvider<unix::SocketAddr> for TcpProvider {
     }
 }
 
-// --- stub listener & uninhabited stream ------------------------------------
-
-/// A listener type that is never actually constructed (listen() errors).
 pub struct StubListener<S, A>(PhantomData<fn() -> (S, A)>);
 
 impl<S, A> NetStreamListener<A> for StubListener<S, A>
@@ -88,7 +80,6 @@ where
     }
 }
 
-/// An uninhabited stream type for the unsupported unix provider.
 pub enum Void {}
 
 impl AsyncRead for Void {
