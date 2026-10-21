@@ -8,7 +8,7 @@ use std::time::Duration;
 use arti_client::config::CfgPath;
 use std::sync::Arc;
 
-use arti_client::{DataStream, TorClient, TorClientConfig};
+use arti_client::{DataStream, IsolationToken, StreamPrefs, TorClient, TorClientConfig};
 use futures::future::FutureExt;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -36,6 +36,7 @@ enum Pending {
 
 thread_local! {
     static CLIENT: RefCell<Option<Arc<TorClient<ArtiRuntime>>>> = const { RefCell::new(None) };
+    static GROUPS: RefCell<HashMap<u32, IsolationToken>> = RefCell::new(HashMap::new());
     static STREAMS: RefCell<HashMap<u32, DataStream>> = RefCell::new(HashMap::new());
     static PENDING: RefCell<HashMap<u32, Pending>> = RefCell::new(HashMap::new());
     static NEXT_ID: Cell<u32> = const { Cell::new(1) };
@@ -118,7 +119,7 @@ pub extern "C" fn arti_bootstrap() -> i32 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn arti_connect_start(host_ptr: *const u8, host_len: usize, port: u16) -> i64 {
+pub extern "C" fn arti_connect_start(host_ptr: *const u8, host_len: usize, port: u16, group: u32) -> i64 {
     let host = match std::str::from_utf8(unsafe {
         std::slice::from_raw_parts(host_ptr, host_len)
     }) {
@@ -142,8 +143,19 @@ pub extern "C" fn arti_connect_start(host_ptr: *const u8, host_len: usize, port:
     });
     PENDING.with(|p| p.borrow_mut().insert(id, Pending::Connecting));
 
+    let isolation = (group != 0)
+        .then(|| GROUPS.with(|g| *g.borrow_mut().entry(group).or_insert_with(IsolationToken::new)));
+
     crate::exec::spawn(async move {
-        let slot = match client.connect((host.clone(), port)).await {
+        let result = match isolation {
+            Some(token) => {
+                let mut prefs = StreamPrefs::new();
+                prefs.set_isolation(token);
+                client.connect_with_prefs((host.clone(), port), &prefs).await
+            }
+            None => client.connect((host.clone(), port)).await,
+        };
+        let slot = match result {
             Ok(stream) => Pending::Ready(stream),
             Err(e) => Pending::Failed(format!("connect to {host}:{port} failed: {e}")),
         };

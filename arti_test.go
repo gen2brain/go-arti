@@ -59,6 +59,25 @@ func TestPoolRoundRobin(t *testing.T) {
 	}
 }
 
+func TestIsolationGroups(t *testing.T) {
+	single := &Client{circuits: 1}
+	for i := 0; i < 3; i++ {
+		if g := single.isolationGroup(); g != 0 {
+			t.Fatalf("single circuit group = %d, want 0", g)
+		}
+	}
+	c := &Client{circuits: 3}
+	seen := map[uint32]int{}
+	for i := 0; i < 9; i++ {
+		seen[c.isolationGroup()]++
+	}
+	for g := uint32(1); g <= 3; g++ {
+		if seen[g] != 3 {
+			t.Errorf("group %d used %d times, want 3 (%v)", g, seen[g], seen)
+		}
+	}
+}
+
 func newBootstrapped(t *testing.T, cacheDir string) *Client {
 	t.Helper()
 	c, err := New(context.Background(), cacheDir)
@@ -281,6 +300,45 @@ func TestPoolConcurrent(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, 4)
 	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resp, err := client.Get("http://example.com/")
+			if err != nil {
+				errs <- err
+				return
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				errs <- fmt.Errorf("status %s", resp.Status)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
+
+func TestCircuitsConcurrent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("network test; skipped under -short")
+	}
+	c, err := New(context.Background(), "", WithCircuits(3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Bootstrap(); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	client := c.HTTPClient()
+	var wg sync.WaitGroup
+	errs := make(chan error, 6)
+	for i := 0; i < 6; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

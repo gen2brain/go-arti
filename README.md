@@ -37,6 +37,13 @@ For concurrency, use a `Pool` of independent instances, which exposes the same D
 p, err := arti.NewPool(context.Background(), "", 4) // 4 independent instances
 ```
 
+By default the connections of one instance may share a Tor circuit, which limits parallel streams to the bandwidth of that circuit.
+`WithCircuits` spreads them over isolated circuits instead, for a `Client` or every instance of a `Pool`:
+
+```go
+p, err := arti.NewPool(context.Background(), "", 2, arti.WithCircuits(2)) // 2 instances, 4 circuit groups
+```
+
 See `examples/fetch` for a runnable demo. `go test -short` runs the unit tests;
 `go test` also runs slow tests that bootstrap the real Tor network.
 

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tetratelabs/wazero"
@@ -51,6 +52,9 @@ type Client struct {
 
 	reactor *reactor
 
+	circuits uint32
+	group    atomic.Uint32
+
 	serveMu    sync.Mutex
 	serveCount int
 	serveStop  chan struct{}
@@ -62,13 +66,22 @@ type Client struct {
 type Option func(*options)
 
 type options struct {
-	stderr io.Writer
-	cache  wazero.CompilationCache
+	stderr   io.Writer
+	cache    wazero.CompilationCache
+	circuits int
 }
 
 // WithStderr sets where diagnostic output goes; the default is os.Stderr.
 func WithStderr(w io.Writer) Option {
 	return func(o *options) { o.stderr = w }
+}
+
+// WithCircuits spreads a Client's connections round-robin over n isolation
+// groups. Connections in different groups never share a Tor circuit, so
+// parallel streams are not limited by the bandwidth of one circuit. The
+// default is 1: all connections may share circuits.
+func WithCircuits(n int) Option {
+	return func(o *options) { o.circuits = n }
 }
 
 // New creates a Client that keeps its state in cacheDir, or in a temporary
@@ -101,7 +114,7 @@ func New(ctx context.Context, cacheDir string, opts ...Option) (*Client, error) 
 	rt := wazero.NewRuntimeWithConfig(ctx, rc)
 	wasi_snapshot_preview1.MustInstantiate(ctx, rt)
 
-	c := &Client{rt: rt, ctx: ctx, dir: root, temp: temp, reactor: newReactor()}
+	c := &Client{rt: rt, ctx: ctx, dir: root, temp: temp, reactor: newReactor(), circuits: uint32(max(o.circuits, 1))}
 
 	if err := c.registerHost(ctx); err != nil {
 		rt.Close(ctx)
@@ -344,6 +357,13 @@ func (c *Client) DialContext(ctx context.Context, _, addr string) (net.Conn, err
 	}
 }
 
+func (c *Client) isolationGroup() uint32 {
+	if c.circuits <= 1 {
+		return 0
+	}
+	return c.group.Add(1)%c.circuits + 1
+}
+
 func (c *Client) connectStart(host string, port int) (uint32, error) {
 	c.callMu.Lock()
 	defer c.callMu.Unlock()
@@ -352,7 +372,7 @@ func (c *Client) connectStart(host string, port int) (uint32, error) {
 		return 0, err
 	}
 	defer c.freeBytes(ptr, len(host))
-	res, err := c.connStart.Call(c.ctx, uint64(ptr), uint64(len(host)), uint64(port))
+	res, err := c.connStart.Call(c.ctx, uint64(ptr), uint64(len(host)), uint64(port), uint64(c.isolationGroup()))
 	if err != nil {
 		return 0, fmt.Errorf("arti: connect: %w", err)
 	}
